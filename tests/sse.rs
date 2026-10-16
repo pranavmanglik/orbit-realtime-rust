@@ -5,7 +5,7 @@ use std::convert::Infallible;
 
 use futures_util::stream;
 use http_body_util::BodyExt;
-use orbit_realtime_rust::{Event, MAX_EVENT_BYTES, encode_comment, response};
+use orbit_realtime_rust::{Event, MAX_EVENT_BYTES, SseBodyError, encode_comment, response};
 
 #[tokio::test]
 async fn encodes_events_and_sets_safe_headers() {
@@ -26,13 +26,47 @@ async fn encodes_events_and_sets_safe_headers() {
         body.headers()["content-type"],
         "text/event-stream; charset=utf-8"
     );
-    assert_eq!(body.headers()["cache-control"], "no-cache");
+    assert_eq!(body.headers()["cache-control"], "no-cache, no-transform");
+    assert_eq!(body.headers()["x-accel-buffering"], "no");
     let bytes = body.into_body().collect().await.expect("body").to_bytes();
     assert!(
         std::str::from_utf8(&bytes)
             .expect("utf8")
             .contains("data: second")
     );
+}
+
+#[tokio::test]
+async fn body_errors_hide_application_details_and_end_the_stream() {
+    let body = response(stream::iter([Err::<Event, _>(std::io::Error::other(
+        "private provider token",
+    ))]))
+    .expect("response")
+    .into_body();
+    let mut body = Box::pin(body);
+
+    let frame = body.as_mut().frame().await.expect("one error frame");
+    let error = frame.expect_err("source error");
+    assert_eq!(error.to_string(), "SSE event source failed");
+    assert!(!error.to_string().contains("private provider token"));
+    assert!(body.as_mut().frame().await.is_none());
+}
+
+#[tokio::test]
+async fn body_reports_bounded_encoding_errors_without_source_details() {
+    let event = Event::new("x".repeat(MAX_EVENT_BYTES - 16))
+        .expect("bounded input")
+        .with_id("identifier")
+        .expect("bounded id");
+    let body = response(stream::iter([Ok::<_, Infallible>(event)]))
+        .expect("response")
+        .into_body();
+    let mut body = Box::pin(body);
+
+    let frame = body.as_mut().frame().await.expect("one error frame");
+    let error = frame.expect_err("encoding error");
+    assert!(matches!(error, SseBodyError::Encoding(_)));
+    assert!(body.as_mut().frame().await.is_none());
 }
 
 #[test]
@@ -60,5 +94,19 @@ fn bounds_fields_and_hides_sensitive_debug_content() {
     assert_eq!(
         encode_comment("keep\nalive").expect("comment"),
         ": keep\n: alive\n\n"
+    );
+}
+
+#[test]
+fn empty_optional_fields_match_python_and_go_contracts() {
+    let event = Event::new("payload")
+        .expect("event")
+        .with_event("")
+        .expect("empty event name")
+        .with_id("")
+        .expect("empty id");
+    assert_eq!(
+        event.encode().expect("encoded"),
+        "event: \nid: \ndata: payload\n\n"
     );
 }

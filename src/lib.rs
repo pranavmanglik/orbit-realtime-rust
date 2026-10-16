@@ -12,6 +12,12 @@
 // limitations under the License.
 
 //! Bounded Server-Sent Events framing and an HTTP-body implementation.
+//!
+//! [`Event`] encodes one validated SSE frame. [`SseBody`] adapts a caller-owned pull-based stream
+//! to `http-body::Body`, producing at most one event per poll and holding no event queue. The host
+//! HTTP runtime owns socket flushing, client-disconnect detection, routing, authentication, and
+//! connection limits. This crate does not provide replay, retention, shared fan-out, or heartbeat
+//! scheduling.
 use std::{
     error::Error,
     fmt,
@@ -24,10 +30,15 @@ use futures_core::Stream;
 use http::{Response, header};
 use http_body::{Body, Frame, SizeHint};
 
+/// Maximum size of a complete encoded event frame.
 pub const MAX_EVENT_BYTES: usize = 65_536;
+/// Maximum UTF-8 byte length of an event type field.
 pub const MAX_EVENT_NAME_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of an event ID field.
 pub const MAX_EVENT_ID_BYTES: usize = 1_024;
+/// Maximum size of a complete encoded comment frame.
 pub const MAX_COMMENT_BYTES: usize = 4_096;
+/// Largest event reconnect delay in milliseconds.
 pub const MAX_RETRY_MS: u32 = 2_147_483_647;
 
 /// Sanitized SSE validation failure categories.
@@ -60,6 +71,9 @@ pub struct Event {
 
 impl Event {
     /// Create an event with application data.
+    ///
+    /// Data may contain line endings, which are normalized during encoding. Its UTF-8 bytes and
+    /// the final framed event must both fit within [`MAX_EVENT_BYTES`].
     pub fn new(data: impl Into<String>) -> Result<Self, SseError> {
         let data = data.into();
         validate_text(&data, MAX_EVENT_BYTES, false, false)?;
@@ -72,6 +86,9 @@ impl Event {
     }
 
     /// Set the event type, rejecting line breaks and oversized UTF-8 values.
+    ///
+    /// An empty value is encoded as an explicit empty `event:` field, selecting the default event
+    /// type. This matches the Python and Go implementations.
     pub fn with_event(mut self, event: impl Into<String>) -> Result<Self, SseError> {
         let event = event.into();
         validate_text(&event, MAX_EVENT_NAME_BYTES, true, false)?;
@@ -80,6 +97,9 @@ impl Event {
     }
 
     /// Set the reconnect ID, rejecting line breaks, NUL, and oversized values.
+    ///
+    /// An empty value is encoded as an explicit empty `id:` field, resetting the client's
+    /// last-event ID. This matches the Python and Go implementations.
     pub fn with_id(mut self, id: impl Into<String>) -> Result<Self, SseError> {
         let id = id.into();
         validate_text(&id, MAX_EVENT_ID_BYTES, true, true)?;
@@ -97,6 +117,9 @@ impl Event {
     }
 
     /// Encode the event using UTF-8 and the HTML event-stream line format.
+    ///
+    /// Data is emitted as one `data:` field per normalized line, followed by the blank line that
+    /// dispatches the event. The complete frame must fit within [`MAX_EVENT_BYTES`].
     pub fn encode(&self) -> Result<Bytes, SseError> {
         let mut frame = String::new();
         if let Some(event) = &self.event {
@@ -138,6 +161,8 @@ impl fmt::Debug for Event {
 }
 
 /// Encode a bounded SSE comment, commonly used as a caller-managed keepalive.
+///
+/// Newlines become separate comment lines; heartbeat scheduling remains the caller's job.
 pub fn encode_comment(comment: &str) -> Result<Bytes, SseError> {
     validate_text(comment, MAX_COMMENT_BYTES, false, false)?;
     let normalized = comment.replace("\r\n", "\n").replace('\r', "\n");
@@ -169,9 +194,34 @@ fn validate_text(
     Ok(())
 }
 
-type BoxError = Box<dyn Error + Send + Sync + 'static>;
+/// Sanitized failure returned by the streaming body.
+///
+/// Provider and application error details are deliberately discarded because HTTP runtimes may
+/// include body errors in operator-facing logs. Producers should record safe telemetry before
+/// returning an error to the stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SseBodyError {
+    /// The event source returned an error.
+    Source,
+    /// An event could not be encoded within the protocol bounds.
+    Encoding(SseError),
+}
+
+impl fmt::Display for SseBodyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => f.write_str("SSE event source failed"),
+            Self::Encoding(error) => write!(f, "SSE event encoding failed: {error}"),
+        }
+    }
+}
+
+impl Error for SseBodyError {}
 
 /// A pull-based body that serializes one event per poll and preserves upstream backpressure.
+///
+/// It does not prefetch. Source or encoding errors are returned once and end the body. Dropping
+/// the body drops the wrapped stream, allowing the caller's source to release its resources.
 pub struct SseBody<S> {
     stream: Pin<Box<S>>,
     ended: bool,
@@ -193,7 +243,7 @@ where
     E: Error + Send + Sync + 'static,
 {
     type Data = Bytes;
-    type Error = BoxError;
+    type Error = SseBodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -208,15 +258,15 @@ where
                 self.ended = true;
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Err(error))) => {
+            Poll::Ready(Some(Err(_error))) => {
                 self.ended = true;
-                Poll::Ready(Some(Err(Box::new(error))))
+                Poll::Ready(Some(Err(SseBodyError::Source)))
             }
             Poll::Ready(Some(Ok(event))) => match event.encode() {
                 Ok(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
                 Err(error) => {
                     self.ended = true;
-                    Poll::Ready(Some(Err(Box::new(error))))
+                    Poll::Ready(Some(Err(SseBodyError::Encoding(error))))
                 }
             },
         }
@@ -230,7 +280,12 @@ where
     }
 }
 
-/// Build an HTTP response with safe default SSE headers.
+/// Build an HTTP response with default SSE content, no-transform caching, and nosniff headers.
+///
+/// The HTTP server owns writing and flushing the body and detecting disconnects. The response
+/// also asks common reverse proxies not to buffer the stream. Route authorization, TLS, other
+/// proxy behavior, timeouts, and connection limits must be configured by the host. Source errors
+/// become [`SseBodyError::Source`] so provider details are not exposed through server logs.
 pub fn response<S, E>(stream: S) -> Result<Response<SseBody<S>>, http::Error>
 where
     S: Stream<Item = Result<Event, E>>,
@@ -239,7 +294,8 @@ where
     Response::builder()
         .status(http::StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CACHE_CONTROL, "no-cache, no-transform")
+        .header(header::HeaderName::from_static("x-accel-buffering"), "no")
         .header(
             header::HeaderName::from_static("x-content-type-options"),
             "nosniff",
